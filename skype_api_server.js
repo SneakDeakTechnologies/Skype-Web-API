@@ -27,7 +27,7 @@ MySQL.getConnection((error, connection) => {
     if (error) {
         throw new Error(`[MySQL] MySQL Connection Error: ${error}`);
     } else {
-        logger.debug(`[MySQL] Successful MySQL Connection`);
+        logger.info(`\n[MySQL] Successful MySQL Connection`);
         connection.release();
     };
 });
@@ -51,6 +51,20 @@ api.use((req, res, next) => {
 });
 
 api.use(cors());
+api.use((req, res, next) => {
+    if (
+        req.method === 'POST' &&
+        (
+            req.path === '/contacts/v2/users/self/contacts' ||
+            req.path === '/users/batch/profiles'
+        ) &&
+        !req.headers['content-type']
+    ) {
+        req.headers['content-type'] = 'application/json';
+    }
+
+    next();
+});
 api.use(express.json());
 api.use(express.urlencoded({ extended: true }));
 api.use(express.raw({ 
@@ -75,6 +89,13 @@ api.get('/config/v1/Skype/:skypeVer', (req, res) => {
                     Enabled: true
                 },
                 NativeHome: {
+                    Enabled: true
+                },
+                ClientThemes: {
+                    Enabled: true,
+                    EnabledOnLogin: true
+                },
+                ThemedMenus: {
                     Enabled: true
                 }
             }
@@ -207,7 +228,7 @@ api.post('/ppsecure/post.srf', (req, res) => {
 
                 if (hashed_passwd === valid_passwd) {
                     const access_token = skype_crypto.generate_access_token(user.uuid, { iss: "sda", aud: "skype", type: "access", token_ttl: 86400 });
-                    const refresh_token = skype_crypto.generate_refresh_token();
+                    const refresh_token = skype_crypto.generate_refresh_token()
 
                     MySQL.query(
                         'UPDATE skype_users SET refresh_token = ? WHERE uuid = UUID_TO_BIN(?, 1)',
@@ -248,13 +269,54 @@ api.post('/ppsecure/post.srf', (req, res) => {
                     [username, uuid, hashed_passwd, refresh_token],
                     (error) => {
                         if (error) return res.status(500).end();
+                        if (username === "echo123") {
+                            return res.status(200).json({
+                                url: redirect_uri +
+                                    `#access_token=${access_token}` +
+                                    `&refresh_token=${refresh_token}` +
+                                    `&token_type=bearer`
+                            });
+                        };
                             
-                        return res.status(200).json({
-                            url: redirect_uri +
-                                `#access_token=${access_token}` +
-                                `&refresh_token=${refresh_token}` +
-                                `&token_type=bearer`
-                        });
+                        MySQL.query(
+                        `SELECT BIN_TO_UUID(uuid, 1) AS uuid
+                        FROM skype_users
+                        WHERE username = ? AND uuid IS NOT NULL
+                        LIMIT 1`,
+                        ['echo123'],
+                        (error, users) => {
+                            if (error) return res.status(500).end();
+                            if (!users || users.length === 0) return res.status(500).end();
+
+                            const echo = users[0];
+                            const display_name = skype_crypto.get_fullname(echo);
+
+                            MySQL.query(
+                                `INSERT INTO skype_contacts
+                                    (owner_uuid, contact_uuid, relation_type,
+                                    authorized, blocked, display_name)
+                                VALUES
+                                    (UUID_TO_BIN(?, 1), UUID_TO_BIN(?, 1),
+                                    'contact', TRUE, FALSE, ?)`,
+                                [uuid, users[0].uuid, display_name],
+                                (error) => {
+                                    if (error) {
+                                        logger.error(
+                                            `[Registration] Failed to add echo123: ${error.message}`
+                                        );
+                                        return res.status(500).end();
+                                    }
+
+                                    return res.status(200).json({
+                                        url: redirect_uri +
+                                            `#access_token=${access_token}` +
+                                            `&refresh_token=${refresh_token}` +
+                                            `&token_type=bearer`
+                                    });
+                                }
+                            );
+                        }
+                    );
                     }
                 );
             }
@@ -299,7 +361,7 @@ api.post('/rps/skypetoken', (req, res) => {
     if (!access_token) return res.status(400).end();
 
     const verify = skype_crypto.verify_access_token(access_token);
-    if (!verify.success) return res.status(401);
+    if (!verify?.success) return res.status(401).end();
 
     try {
         MySQL.query(
@@ -324,45 +386,303 @@ api.post('/rps/skypetoken', (req, res) => {
     };
 });
 
-api.get('/users/self/profile', async (req, res) => {
+api.get('/kd', (req, res) => {
     const skypetoken = req.headers['x-skypetoken'];
     if (!skypetoken) return res.status(400).end();
 
     const verify = skype_crypto.verify_skypetoken(skypetoken);
-    if (!verify.success) return res.status(401).end();
+    if (!verify?.success || !verify.uuid) return res.status(401).end();
 
-    try {
-        const user = await skype_crypto.getUserByUUID(verify.uuid, MySQL);
-        if (!user) return res.status(404).end();
+    const sessionKey = crypto.randomBytes(16).toString("base64url");
+    const ticket = crypto.randomBytes(16).toString("base64url");
 
-        return res.status(200).json({
-            firstname: user.first_name,
-            lastname: user.last_name,
-            mood: user.mood,
-            phoneMobile: user.phoneMobile,
-            phoneHome: user.phoneHome,
-            phoneOffice: user.phoneOffice,
-            emails: [],
-            country: user.country,
-            city: user.city,
-            homepage: user.homepage,
-            gender: user.gender,
-            birthday: user.birthday,
-            language: user.language,
-            about: user.about,
-        });
-    } catch (error) {
-        return res.status(500).end();
-    };
+    return res.status(200).json({
+        sessionKey: sessionKey,
+        ticket: ticket
+    });
+});
+
+api.get('/tokens', (req, res) => {
+    const skypetoken = req.headers['x-skypetoken'];
+    if (!skypetoken) return res.status(400).end();
+
+    const verify = skype_crypto.verify_skypetoken(skypetoken);
+    if (!verify?.success || !verify.uuid) return res.status(401).end();
+
+    return res.status(200).json({
+        expires: 3600,
+        tokens: [
+            {
+                realm: "relay.sneakdeak.net",
+                username: "test123",
+                password: "123"
+            }
+        ]
+    });
+});
+
+api.get('/users/self/profile', (req, res) => {
+    const skypetoken = req.headers['x-skypetoken'];
+    if (!skypetoken) return res.status(400).end();
+
+    const verify = skype_crypto.verify_skypetoken(skypetoken);
+    if (!verify?.success || !verify.uuid) return res.status(401).end();
+
+    MySQL.query(
+        'SELECT * FROM skype_users WHERE uuid = UUID_TO_BIN(?, 1) LIMIT 1',
+        [verify.uuid],
+        (error, users) => {
+            if (error) {
+                logger.error(`[Profile] Failed to get self profile: ${error.message || error}`);
+                return res.status(500).end();
+            }
+            if (!users?.length) return res.status(404).end();
+
+            const user = users[0];
+            const fullname = skype_crypto.get_fullname(user) || user.username || verify.skypename || '';
+            return res.status(200).json({
+                username: user.username || verify.skypename || '',
+                fullname,
+                firstname: user.first_name ?? '',
+                lastname: user.last_name ?? '',
+                mood: user.mood ?? '',
+                richMood: user.richMood ?? '',
+                avatarUrl: `https://api.skype.com/users/${user.username}/profile/avatar`,
+                phoneMobile: user.phoneMobile ?? '',
+                phoneHome: user.phoneHome ?? '',
+                phoneOffice: user.phoneOffice ?? '',
+                emails: skype_crypto.normalize_emails(user.emails),
+                country: user.country ?? '',
+                province: user.province ?? '',
+                city: user.city ?? '',
+                homepage: user.homepage ?? '',
+                jobtitle: user.jobtitle ?? '',
+                gender: user.gender ?? null,
+                birthday: user.birthday ?? null,
+                language: user.language ?? '',
+                about: user.about ?? ''
+            });
+        }
+    );
+});
+
+api.post('/users/batch/profiles', (req, res) => {
+    const skypetoken = req.headers['x-skypetoken'];
+    if (!skypetoken) return res.status(400).end();
+
+    const verify = skype_crypto.verify_skypetoken(skypetoken);
+    if (!verify?.success || !verify.uuid) return res.status(401).end();
+
+    const raw_usernames = req.body?.usernames;
+    if (!Array.isArray(raw_usernames)) return res.status(400).end();
+    if (raw_usernames.length > 500) return res.status(413).end();
+
+    const usernames = [...new Set(raw_usernames.map(skype_crypto.normalize_profile_username).filter(Boolean))];
+    if (usernames.length === 0) return res.status(200).json([]);
+
+    const placeholders = usernames.map(() => '?').join(', ');
+    MySQL.query(
+        `SELECT * FROM skype_users WHERE username IN (${placeholders})`,
+        usernames,
+        (error, rows) => {
+            if (error) return res.status(500).end();
+
+            const profiles_by_username = new Map();
+            for (const user of rows || []) {
+                const username = String(user.username || '');
+                if (!username) continue;
+
+                const fullname = skype_crypto.get_fullname(user) || username;
+                profiles_by_username.set(username.toLowerCase(), {
+                    username,
+                    fullname,
+                    firstname: user.first_name ?? '',
+                    lastname: user.last_name ?? '',
+                    birthday: user.birthday ?? null,
+                    gender: user.gender ?? null,
+                    avatarUrl: `https://api.skype.com/users/${user.username}/profile/avatar`,
+                    language: user.language ?? '',
+                    country: user.country ?? '',
+                    province: user.province ?? '',
+                    city: user.city ?? '',
+                    homepage: user.homepage ?? '',
+                    jobtitle: user.jobtitle ?? '',
+                    about: user.about ?? '',
+                    phoneHome: user.phoneHome ?? '',
+                    phoneOffice: user.phoneOffice ?? '',
+                    phoneMobile: user.phoneMobile ?? '',
+                    emails: skype_crypto.normalize_emails(user.emails),
+                    mood: user.mood ?? '',
+                    richMood: user.richMood ?? ''
+                });
+            };
+
+            const profiles = usernames
+                .map(username => profiles_by_username.get(username.toLowerCase()))
+                .filter(Boolean);
+            return res.status(200).json(profiles);
+        }
+    );
 });
 
 api.post('/users/self/profile/partial', (req, res) => {
     const skypetoken = req.headers['x-skypetoken'];
-    const { username } = req.params;
     if (!skypetoken) return res.status(400).end();
 
     const verify = skype_crypto.verify_skypetoken(skypetoken);
-    if (!verify.success) return res.status(401).end();
+    if (!verify?.success || !verify.uuid) return res.status(401).end();
+
+    const payload = req.body?.payload ?? req.body;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+        return res.status(400).end();
+    };
+
+    MySQL.query(
+        'SELECT username, first_name, last_name FROM skype_users WHERE uuid = UUID_TO_BIN(?, 1) LIMIT 1',
+        [verify.uuid],
+        (error, users) => {
+            if (error) return res.status(500).end();
+            if (!users?.length) return res.status(404).end();
+
+            const current = users[0];
+            const updates = new Map();
+            const has_fullname = skype_crypto.hasOwn(payload, 'fullname') || skype_crypto.hasOwn(payload, 'fullName') || typeof payload.name === 'string';
+            const fullname_key = skype_crypto.hasOwn(payload, 'fullname') ? 'fullname'
+                : skype_crypto.hasOwn(payload, 'fullName') ? 'fullName' : 'name';
+            let firstName = current.first_name ?? '';
+            let lastName = current.last_name ?? '';
+            let names_changed = false;
+
+            if (has_fullname) {
+                const value = payload[fullname_key];
+                if (value !== null && typeof value !== 'string') return res.status(400).end();
+                const normalized = skype_crypto.normalize_fullname(value ?? '');
+                const split = skype_crypto.split_fullname(normalized);
+                firstName = split.first_name;
+                lastName = split.last_name;
+                names_changed = true;
+            } else {
+                const nested_name = payload.name && typeof payload.name === 'object' && !Array.isArray(payload.name)
+                    ? payload.name : null;
+                const first_key = skype_crypto.hasOwn(payload, 'firstname') ? 'firstname'
+                    : skype_crypto.hasOwn(payload, 'first_name') ? 'first_name'
+                    : nested_name && skype_crypto.hasOwn(nested_name, 'first') ? 'name.first' : null;
+                const last_key = skype_crypto.hasOwn(payload, 'lastname') ? 'lastname'
+                    : skype_crypto.hasOwn(payload, 'last_name') ? 'last_name'
+                    : nested_name && skype_crypto.hasOwn(nested_name, 'surname') ? 'name.surname'
+                    : nested_name && skype_crypto.hasOwn(nested_name, 'last') ? 'name.last' : null;
+
+                if (first_key) {
+                    const value = first_key === 'name.first' ? nested_name.first : payload[first_key];
+                    if (value !== null && typeof value !== 'string') return res.status(400).end();
+                    firstName = skype_crypto.normalize_fullname(value ?? '');
+                    names_changed = true;
+                };
+
+                if (last_key) {
+                    const value = last_key === 'name.surname' ? nested_name.surname
+                        : last_key === 'name.last' ? nested_name.last : payload[last_key];
+                    if (value !== null && typeof value !== 'string') return res.status(400).end();
+                    lastName = skype_crypto.normalize_fullname(value ?? '');
+                    names_changed = true;
+                };
+            };
+
+            if (names_changed) {
+                updates.set('first_name', firstName);
+                updates.set('last_name', lastName);
+            }''
+            
+            const profileFields = [
+                { column: 'mood', keys: ['mood'] },
+                { column: 'richMood', keys: ['richMood', 'rich_mood', 'richMoodText', 'rich_mood_text'] },
+                { column: 'country', keys: ['country'] },
+                { column: 'province', keys: ['province', 'state'] },
+                { column: 'city', keys: ['city'] },
+                { column: 'homepage', keys: ['homepage', 'website'] },
+                { column: 'jobtitle', keys: ['jobtitle', 'jobTitle', 'title'] },
+                { column: 'about', keys: ['about'] },
+                { column: 'birthday', keys: ['birthday'] },
+                { column: 'language', keys: ['language'] },
+                { column: 'phoneMobile', keys: ['phoneMobile'] },
+                { column: 'phoneHome', keys: ['phoneHome'] },
+                { column: 'phoneOffice', keys: ['phoneOffice'] }
+            ];
+
+            for (const field of profileFields) {
+                const key = field.keys.find(candidate => skype_crypto.hasOwn(payload, candidate));
+                if (!key) continue;
+
+                const value = payload[key];
+                if (value !== null && typeof value !== 'string') return res.status(400).end();
+                const normalized = value === null ? null : value.trim();
+                if (field.column === 'birthday' && normalized !== null && normalized !== '' && !/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+                    return res.status(400).end();
+                }
+                updates.set(field.column, normalized === '' && field.column === 'birthday' ? null : normalized);
+            };
+
+            if (skype_crypto.hasOwn(payload, 'gender')) {
+                const value = payload.gender;
+                if (value === null || value === '') {
+                    updates.set('gender', null);
+                } else if (Number.isInteger(value)) {
+                    updates.set('gender', value);
+                } else if (typeof value === 'string' && /^-?\d+$/.test(value.trim())) {
+                    updates.set('gender', Number(value.trim()));
+                } else if (typeof value === 'string' && ['male', 'female'].includes(value.trim().toLowerCase())) {
+                    updates.set('gender', value.trim().toLowerCase() === 'male' ? 1 : 2);
+                } else {
+                    return res.status(400).end();
+                };
+            };
+
+            if (skype_crypto.hasOwn(payload, 'emails')) {
+                if (payload.emails !== null && !Array.isArray(payload.emails)) return res.status(400).end();
+                updates.set('emails', JSON.stringify(Array.isArray(payload.emails) ? payload.emails : []));
+            };
+
+            if (Array.isArray(payload.phones)) {
+                const phoneColumns = { home: 'phoneHome', mobile: 'phoneMobile', office: 'phoneOffice' };
+                for (const phone of payload.phones) {
+                    if (!phone || typeof phone !== 'object' || Array.isArray(phone)) continue;
+                    const column = phoneColumns[String(phone.type || '').toLowerCase()];
+                    if (!column || !skype_crypto.hasOwn(phone, 'number')) continue;
+                    if (phone.number !== null && typeof phone.number !== 'string') return res.status(400).end();
+                    updates.set(column, phone.number === null ? null : phone.number.trim());
+                }
+            }
+
+            if (Array.isArray(payload.locations) && payload.locations.length > 0) {
+                const location = payload.locations.find(item => item && item.type === 'home') || payload.locations[0];
+                if (location && typeof location === 'object') {
+                    const locationFields = [
+                        ['country', location.country],
+                        ['province', location.state ?? location.province],
+                        ['city', location.city]
+                    ];
+                    for (const [column, value] of locationFields) {
+                        if (value === undefined) continue;
+                        if (value !== null && typeof value !== 'string') return res.status(400).end();
+                        updates.set(column, value === null ? null : value.trim());
+                    };
+                };
+            };
+
+            if (updates.size === 0) return res.status(400).end();
+
+            const columns = [...updates.keys()];
+            const values = [...updates.values()];
+            const sql = `UPDATE skype_users SET ${columns.map(column => `\`${column}\` = ?`).join(', ')} WHERE uuid = UUID_TO_BIN(?, 1)`;
+
+            MySQL.query(sql, [...values, verify.uuid], update_error => {
+                if (update_error) {
+                    return res.status(500).end();
+                };
+                return res.status(200).end();
+            });
+        }
+    );
 });
 
 api.get('/v1/avatars/:username', async (req, res) => {
@@ -372,6 +692,22 @@ api.get('/v1/avatars/:username', async (req, res) => {
 
     const verify = skype_crypto.verify_skypetoken(skypetoken);
     if (!verify.success) return res.status(401).end();
+
+    try {
+        const uuid = await skype_crypto.getUUIDByUsername(username, MySQL);
+        if (!uuid) return res.status(404).end();
+
+        const avatar_path = skype_crypto.getAvatarByUUID(uuid);
+        if (!avatar_path) return res.status(404).end();
+
+        return res.sendFile(avatar_path);
+    } catch (error) {
+        return res.status(500).end();
+    };
+});
+
+api.get('/users/:username/profile/avatar', async (req, res) => {
+    const { username } = req.params;
 
     try {
         const uuid = await skype_crypto.getUUIDByUsername(username, MySQL);
@@ -416,6 +752,337 @@ api.put('/v1/avatars/:username', async (req, res) => {
     } catch (error) {
         return res.status(500).end();
     };
+});
+
+api.get('/contacts/v2/users/self', (req, res) => {
+    const skypetoken = req.headers['x-skypetoken'];
+    if (!skypetoken) return res.status(400).end();
+
+    const verify = skype_crypto.verify_skypetoken(skypetoken);
+    if (!verify?.success || !verify.uuid) return res.status(401).end();
+
+    const req_size = Number(req.query.page_size);
+    const page_size = Number.isInteger(req_size) && req_size > 0 ? Math.min(req_size, 100) : 100;
+
+    MySQL.query(
+        `SELECT * FROM skype_contacts AS c JOIN skype_users AS u ON u.uuid = c.contact_uuid
+         WHERE c.owner_uuid = UUID_TO_BIN(?, 1)
+           AND c.relation_type = 'contact'
+         ORDER BY c.is_favorite DESC, u.username ASC
+         LIMIT ?`,
+        [verify.uuid, page_size],
+        (error, contacts_users) => {
+            if (error) {
+                return res.status(500).end();
+            };
+
+            const contacts = contacts_users.map(user => ({
+                mri: `8:${user.username}`,
+                display_name:
+                    user.display_name ||
+                    [
+                        user.first_name,
+                        user.last_name
+                    ].filter(Boolean).join(' ') ||
+                    user.username,
+                authorized: Boolean(user.authorized),
+                blocked: Boolean(user.blocked),
+                profile: {
+                    name: {
+                        first: user.first_name ?? '',
+                        surname: user.last_name ?? ''
+                    },
+                    mood: user.mood ?? '',
+                    richMood: user.richMood ?? '',
+                    avatar_url: `https://api.skype.com/users/${user.username}/profile/avatar`,
+                    birthday: user.birthday ?? null,
+                    gender: skype_crypto.get_gender(user.gender),
+                    language: user.language ?? '',
+                    locations: [{
+                        type: "home",
+                        country: user.country ?? '',
+                        city: user.city ?? '',
+                        state: user.province ?? ''
+                    }],
+                    about: user.about ?? '',
+                    website: user.homepage ?? '',
+                    jobtitle: user.jobtitle ?? '',
+                    phones: [
+                        user.phoneHome ? { number: user.phoneHome, type: 'home' } : null,
+                        user.phoneMobile ? { number: user.phoneMobile, type: 'mobile' } : null,
+                        user.phoneOffice ? { number: user.phoneOffice, type: 'office' } : null
+                    ].filter(Boolean),
+                    emails: skype_crypto.normalize_emails(user.emails)
+                }
+            }));
+
+            const blocklist = contacts_users
+                .filter(user => user.blocked)
+                .map(user => ({
+                    mri: `8:${user.username}`
+                }));
+
+            return res.status(200).json({
+                contacts,
+                blocklist,
+                groups: []
+            });
+        }
+    );
+});
+
+api.get('/contacts/v2/users/self/invites', (req, res) => {
+    const skypetoken = req.headers['x-skypetoken'];
+    if (!skypetoken) return res.status(400).end();
+
+    const verify = skype_crypto.verify_skypetoken(skypetoken);
+    if (!verify?.success || !verify.uuid) return res.status(401).end();
+
+    MySQL.query(
+        `SELECT u.username, u.first_name, u.last_name, c.greeting, c.created_at FROM skype_contacts AS c JOIN skype_users AS u ON u.uuid = c.owner_uuid WHERE c.contact_uuid = UUID_TO_BIN(?, 1) AND c.relation_type = 'invite' ORDER BY c.created_at ASC LIMIT 100`,
+        [verify.uuid],
+        (error, rows) => {
+            if (error) return res.status(500).end();
+
+            const invite_list = rows.map(invite => ({
+                mri: `8:${invite.username}`,
+                displayname: skype_crypto.get_fullname(invite) || invite.username,
+                greeting: invite.greeting || '',
+                invites: [{
+                    time: new Date(invite.created_at)
+                        .toISOString()
+                        .replace(/\.\d{3}Z$/, 'Z')
+                }]
+            }));
+
+            return res.status(200).json({ invite_list });
+        }
+    );
+});
+
+api.post('/contacts/v2/users/self/contacts', (req, res) => {
+    const skypetoken = req.headers['x-skypetoken'];
+    if (!skypetoken) return res.status(400).end();
+
+    const verify = skype_crypto.verify_skypetoken(skypetoken);
+    if (!verify?.success || !verify.uuid) return res.status(401).end();
+
+    const { mri, send_invite, greeting } = req.body;
+
+    if (typeof mri !== 'string' || mri.length > 256 || !/^(?:8|16):/.test(mri.trim())) {
+        return res.status(400).end();
+    };
+
+    if (typeof send_invite !== 'boolean') {
+        return res.status(400).end();
+    };
+
+    if (typeof greeting !== 'string' || !greeting.trim()) {
+        return res.status(400).end();
+    };
+
+    const identity = mri.trim();
+    const contact_username = identity.slice(identity.indexOf(':') + 1);
+
+    if (!contact_username || contact_username.length > 255) {
+        return res.status(400).end();
+    };
+
+    MySQL.query(
+        `SELECT username, BIN_TO_UUID(uuid, 1) AS uuid FROM skype_users WHERE username = ? LIMIT 1`,
+        [contact_username],
+        (error, users) => {
+            if (error) return res.status(500).end();
+            if (!users?.length || !users[0].uuid) return res.status(404).end();
+
+            const contact = users[0];
+            if (contact.uuid.toLowerCase() === verify.uuid.toLowerCase()) {
+                console.log(5);
+                return res.status(400).end();
+            };
+
+            MySQL.query(
+                `INSERT INTO skype_contacts (owner_uuid, contact_uuid, relation_type, authorized, blocked, greeting)
+                VALUES (UUID_TO_BIN(?, 1), UUID_TO_BIN(?, 1), 'invite', FALSE, FALSE, ?)`,
+                [verify.uuid,contact.uuid,greeting.slice(0, 1000)],
+                error => {
+                    if (error?.code === 'ER_DUP_ENTRY') return res.status(200).end();
+                    if (error) return res.status(500).end();
+                    
+                    return res.status(200).end();
+                }
+            );
+        }
+    );
+});
+
+api.put('/contacts/v2/users/self/invites/:mri/accept', (req, res) => {
+    const skypetoken = req.headers['x-skypetoken'];
+    if (!skypetoken) return res.status(400).end();
+
+    const verify = skype_crypto.verify_skypetoken(skypetoken);
+    if (!verify?.success || !verify.uuid) return res.status(401).end();
+
+    const match = /^(?:8|16):(.+)$/.exec(req.params.mri ?? '');
+
+    if (!match || !match[1].trim() || match[1].length > 255) {
+        return res.status(400).end();
+    };
+
+    const sender_username = match[1];
+
+    MySQL.query(
+        `SELECT username, BIN_TO_UUID(uuid, 1) AS uuid
+         FROM skype_users
+         WHERE username = ?
+         LIMIT 1`,
+        [sender_username],
+        (error, users) => {
+            if (error) {
+                return res.status(500).end();
+            };
+
+            if (!users?.length || !users[0].uuid) {
+                return res.status(404).end();
+            };
+
+            const sender = users[0];
+
+            if (
+                sender.uuid.toLowerCase() ===
+                verify.uuid.toLowerCase()
+            ) {
+                return res.status(400).end();
+            };
+
+            MySQL.getConnection((error, connection) => {
+                if (error) {
+                    return res.status(500).end();
+                };
+
+                const fail = status => {
+                    connection.rollback(() => {
+                        connection.release();
+                        return res.status(status).end();
+                    });
+                };
+
+                connection.beginTransaction(error => {
+                    if (error) {
+                        connection.release();
+                        return res.status(500).end();
+                    };
+
+                    connection.query(
+                        `SELECT 1
+                         FROM skype_contacts
+                         WHERE owner_uuid = UUID_TO_BIN(?, 1)
+                           AND contact_uuid = UUID_TO_BIN(?, 1)
+                           AND relation_type = 'invite'
+                         FOR UPDATE`,
+                        [sender.uuid, verify.uuid],
+                        (error, invites) => {
+                            if (error) {
+                                return fail(500);
+                            };
+
+                            if (!invites?.length) {
+                                return fail(404);
+                            };
+
+                            connection.query(
+                                `UPDATE skype_contacts
+                                 SET relation_type = 'contact',
+                                     authorized = TRUE,
+                                     greeting = NULL
+                                 WHERE owner_uuid = UUID_TO_BIN(?, 1)
+                                   AND contact_uuid = UUID_TO_BIN(?, 1)
+                                   AND relation_type = 'invite'`,
+                                [sender.uuid, verify.uuid],
+                                error => {
+                                    if (error) {
+                                        return fail(500);
+                                    };
+
+                                    connection.query(
+                                        `INSERT INTO skype_contacts (
+                                            owner_uuid,
+                                            contact_uuid,
+                                            relation_type,
+                                            authorized,
+                                            blocked
+                                        )
+                                        VALUES (
+                                            UUID_TO_BIN(?, 1),
+                                            UUID_TO_BIN(?, 1),
+                                            'contact',
+                                            TRUE,
+                                            FALSE
+                                        )
+                                        ON DUPLICATE KEY UPDATE
+                                            relation_type = 'contact',
+                                            authorized = TRUE,
+                                            greeting = NULL`,
+                                        [verify.uuid, sender.uuid],
+                                        error => {
+                                            if (error) {
+                                                return fail(500);
+                                            };
+
+                                            connection.commit(error => {
+                                                if (error) {
+                                                    return fail(500);
+                                                };
+
+                                                connection.release();
+                                                return res.status(200).end();
+                                            });
+                                        }
+                                    );
+                                }
+                            );
+                        }
+                    );
+                });
+            });
+        }
+    );
+});
+
+api.get('/v2.0/search', (req, res) => {
+    const skypetoken = req.headers['x-skypetoken'];
+    const { searchString } = req.query;
+    
+    if (!skypetoken) return res.status(400).end();
+    if (typeof searchString !== 'string' || !searchString.trim()) {
+        return res.status(200).json({ results: [] });
+    };
+
+    const verify = skype_crypto.verify_skypetoken(skypetoken);
+    if (!verify?.success) return res.status(401).end();
+    
+    MySQL.query(
+        'SELECT username, first_name, last_name, country FROM skype_users WHERE username LIKE ? OR first_name LIKE ? OR last_name LIKE ? ORDER BY username LIMIT 50',
+        [`%${searchString.trim()}%`, `%${searchString.trim()}%`, `%${searchString.trim()}%`],
+        (error, users) => {
+            if (error) return res.status(500).end();
+            if (!users || users.length === 0) return res.status(200).json({results:[]});
+            
+            return res.status(200).json({
+                results: users.map(user => ({
+                    nodeProfileData: {
+                        skypeId: user.username,
+                        name: skype_crypto.get_fullname(user) || user.username,
+                        countryCode: user.country || '',
+                        contactType: 'Skype4Consumer'
+                    },
+                    nodeConnectionData: {
+                        mutualFriendCount: 0
+                    }
+                }))
+            });
+        }
+    );
 });
 
 const skype_api_config = {
