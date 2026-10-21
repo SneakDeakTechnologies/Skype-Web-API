@@ -73,6 +73,43 @@ api.use(express.raw({
 }));
 api.use(express.static(path.join(__dirname, 'public')));
 
+async function notify_trouter_invite(recepient_uuid) {
+    const secret = process.env.trouter_internal_secret;
+    const url = process.env.trouter_notify_url || 'http://127.0.0.1:8765/internal/notify-invites';
+
+    if (!secret) {
+        logger.error('[API] Trouter internal secret is not configured');
+        return;
+    };
+
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Internal-Secret': secret
+            },
+            body: JSON.stringify({ recepient_uuid }),
+            signal: AbortSignal.timeout(2000)
+        });
+
+        if (!response.ok) {
+            logger.warn(
+                `[INFO] Trouter notification failed: HTTP ${response.status}`
+            );
+            return;
+        }
+
+        const result = await response.json();
+
+        logger.info(
+            `[INFO] Trouter notification result: ${JSON.stringify(result)}`
+        );
+    } catch (error) {
+        logger.warn(`[INFO] Trouter notification error: ${error.message}`);
+    };
+};
+
 api.get('/config/v1/Skype/:skypeVer', (req, res) => {
     const { skypeVer } = req.params;
 
@@ -897,7 +934,6 @@ api.post('/contacts/v2/users/self/contacts', (req, res) => {
 
             const contact = users[0];
             if (contact.uuid.toLowerCase() === verify.uuid.toLowerCase()) {
-                console.log(5);
                 return res.status(400).end();
             };
 
@@ -908,7 +944,8 @@ api.post('/contacts/v2/users/self/contacts', (req, res) => {
                 error => {
                     if (error?.code === 'ER_DUP_ENTRY') return res.status(200).end();
                     if (error) return res.status(500).end();
-                    
+
+                    void notify_trouter_invite(contact.uuid);
                     return res.status(200).end();
                 }
             );
